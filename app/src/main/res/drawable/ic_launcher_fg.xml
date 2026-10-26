@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Shield (the wall) with a lifebuoy ring inside. 108dp adaptive canvas, content in the 66dp safe zone. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp" android:height="108dp"
+    android:viewportWidth="108" android:viewportHeight="108">
+    <path android:fillColor="#13A89E"
+        android:pathData="M54,24 L78,32 L78,52 C78,68 67,80 54,85 C41,80 30,68 30,52 L30,32 Z" />
+    <path android:fillColor="#F4F1EA"
+        android:pathData="M54,40 A14,14 0 1,1 53.99,40 Z M54,47 A7,7 0 1,0 54.01,47 Z" />
+    <path android:fillColor="#E4572E"
+        android:pathData="M51,40.3 L57,40.3 L57,47.6 L51,47.6 Z M51,60.4 L57,60.4 L57,67.7 L51,67.7 Z M40.3,51 L47.6,51 L47.6,57 L40.3,57 Z M60.4,51 L67.7,51 L67.7,57 L60.4,57 Z" />
+</vector>

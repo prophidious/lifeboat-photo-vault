@@ -1,0 +1,9 @@
+<resources>
+    <style name="Theme.Lifeboat" parent="Theme.Material3.DayNight.NoActionBar">
+        <item name="colorPrimary">@color/sea</item>
+        <item name="colorSecondary">@color/navy</item>
+    </style>
+    <style name="Theme.Lifeboat.Viewer" parent="Theme.Lifeboat">
+        <item name="android:windowBackground">@android:color/black</item>
+    </style>
+</resources>
