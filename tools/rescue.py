@@ -11,8 +11,16 @@ Run it on a computer, with the SD card in a card reader. Needs Python 3.8+ and n
   2) Or scan the card directly:
        python rescue.py scan   <card>  RecoveredPhotos
 
-  3) Already used PhotoRec/DiskDigger? Sort its messy output by year, drop duplicates:
+  3) Already have recovered photos (from Lifeboat, PhotoRec, DiskDigger...)? Sort them into
+     year/month folders and drop duplicates:
        python rescue.py sort   recup_dir_folder  SortedPhotos
+
+  4) Find LOOK-ALIKE photos (burst shots, resized/re-saved copies) in a sorted folder.
+     Nothing is deleted - look-alikes are MOVED into _possible_duplicates for you to check:
+       python rescue.py similar  SortedPhotos
+       python rescue.py undo     SortedPhotos      (puts everything back)
+     scan and sort do this automatically at the end. Needs Pillow:
+       Kali/Debian/Ubuntu: sudo apt install python3-pil     others: pip install pillow
 
   <card> is the whole SD card device:
      Linux:   /dev/sdX        (find it with: lsblk)                 run with sudo
@@ -24,8 +32,8 @@ Run it on a computer, with the SD card in a card reader. Needs Python 3.8+ and n
 How it works: deleting a file only marks its space as free - the photo bytes stay on the card
 until something new overwrites them. This tool reads every sector of the card, finds the
 start of JPEG/PNG/HEIC/MP4/MOV files, follows each file's own internal structure to find
-where it ends, and writes it out. Then it files everything into year folders using the date
-stored inside each photo, and removes exact duplicates.
+where it ends, and writes it out. Then it files everything into year/month folders using the
+date stored inside each photo, removes exact duplicates, and sets aside look-alikes.
 """
 import hashlib
 import os
@@ -268,7 +276,8 @@ class Sink:
         self.idx.flush()
         d = file_date(tmp, ext)
         small = ext in (".jpg", ".png") and size < 30 * 1024
-        folder = "_small_or_thumbnails" if small else (str(d.year) if d else "unknown_date")
+        folder = "_small_or_thumbnails" if small else (
+            os.path.join(str(d.year), d.strftime("%m-%B")) if d else "unknown_date")
         name = (d.strftime("%Y-%m-%d_%H%M%S") if d else "photo") + "_" + digest[:8] + ext
         dest_dir = os.path.join(self.out, folder)
         os.makedirs(dest_dir, exist_ok=True)
@@ -347,6 +356,7 @@ def cmd_scan(src, out):
             print(f"\r  {pct}  found {sink.saved} photos/videos ({sink.dupes} duplicates skipped)", end="", flush=True)
     print(f"\nDone in {int(time.time() - t0)}s. Recovered {sink.saved} files into: {out}")
     print("Look in the year folders first. 'unknown_date' has files with no date inside them.")
+    cmd_similar(out)
 
 
 def cmd_sort(src, out):
@@ -368,6 +378,150 @@ def cmd_sort(src, out):
             if n % 100 == 0:
                 print(f"\r  {n} files…", end="", flush=True)
     print(f"\nSorted {sink.saved} unique files ({sink.dupes} duplicates dropped) into {out}")
+    cmd_similar(out)
+
+
+# ---------- look-alike photos (burst shots, resized / re-saved copies) ----------
+DUP_DIR = "_possible_duplicates"
+SKIP_DIRS = {DUP_DIR, "_small_or_thumbnails"}
+PHOTO_EXTS = {".jpg", ".jpeg", ".png", ".heic", ".heif", ".webp", ".gif", ".avif"}
+SIMILAR_BITS = 6  # out of 64; lower = stricter
+
+
+def _load_pillow():
+    try:
+        from PIL import Image, ImageOps
+    except ImportError:
+        return None
+    try:  # optional: lets Pillow open .heic
+        from pillow_heif import register_heif_opener
+        register_heif_opener()
+    except Exception:
+        pass
+    return Image, ImageOps
+
+
+def _fingerprint(Image, ImageOps, path):
+    """64-bit 'difference hash' of the picture's shape, plus its pixel count. Same photo at a
+    different size/quality gives (almost) the same hash."""
+    with Image.open(path) as im:
+        pixels = im.size[0] * im.size[1]
+        try:
+            im.draft("L", (64, 64))  # JPEG: decode at low resolution, much faster
+        except Exception:
+            pass
+        im = ImageOps.exif_transpose(im)
+        w, h = im.size
+        g = im.convert("L").resize((9, 8))
+    px = g.tobytes()
+    bits = 0
+    for row in range(8):
+        for col in range(8):
+            bits = (bits << 1) | (px[row * 9 + col] > px[row * 9 + col + 1])
+    return bits, pixels, (w / h if h else 0)
+
+
+def cmd_similar(folder):
+    lib = _load_pillow()
+    if not lib:
+        print("\nTip: to also find look-alike photos (burst shots, resized copies), install Pillow:")
+        print("     sudo apt install python3-pil      then run:  python3 rescue.py similar", folder)
+        return
+    Image, ImageOps = lib
+    files = []
+    for root, dirs, names in os.walk(folder):
+        dirs[:] = [d for d in dirs if d not in SKIP_DIRS and not d.startswith(".")]
+        for fn in names:
+            if os.path.splitext(fn)[1].lower() in PHOTO_EXTS:
+                files.append(os.path.join(root, fn))
+    files.sort()
+    print(f"\nLooking for look-alike photos among {len(files)} pictures...")
+    info, failed = [], 0
+    for i, p in enumerate(files):
+        try:
+            info.append((p,) + _fingerprint(Image, ImageOps, p) + (os.path.getsize(p),))
+        except Exception:
+            failed += 1  # broken/half-recovered or unsupported file: leave it alone
+        if i % 200 == 0:
+            print(f"\r  checked {i}/{len(files)}", end="", flush=True)
+    print(f"\r  checked {len(files)}/{len(files)}" + (f"  ({failed} couldn't be opened)" if failed else ""))
+
+    # group: split each 64-bit hash into 8 bytes; two hashes within 7 bits always share a byte
+    parent = list(range(len(info)))
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    buckets = {}
+    for idx, (_, h, _, ratio, _) in enumerate(info):
+        for band in range(8):
+            buckets.setdefault((band, (h >> (band * 8)) & 0xFF), []).append(idx)
+    for members in buckets.values():
+        if len(members) < 2:
+            continue
+        for a_i, a in enumerate(members):
+            ha, ra = info[a][1], info[a][3]
+            for b in members[a_i + 1:]:
+                if find(a) == find(b):
+                    continue
+                if bin(ha ^ info[b][1]).count("1") <= SIMILAR_BITS and abs(ra - info[b][3]) < 0.05:
+                    parent[find(b)] = find(a)
+
+    groups = {}
+    for idx in range(len(info)):
+        groups.setdefault(find(idx), []).append(idx)
+    groups = [g for g in groups.values() if len(g) > 1]
+    if not groups:
+        print("No look-alike photos found.")
+        return
+    dup_root = os.path.join(folder, DUP_DIR)
+    os.makedirs(dup_root, exist_ok=True)
+    log = open(os.path.join(dup_root, "moves.txt"), "a")
+    existing = len([d for d in os.listdir(dup_root) if d.startswith("group_")])
+    moved = 0
+    for n, g in enumerate(groups, existing + 1):
+        # keep the biggest picture (most pixels, then biggest file) where it is
+        g.sort(key=lambda i: (-info[i][2], -info[i][4], info[i][0]))
+        keep = info[g[0]][0]
+        gdir = os.path.join(dup_root, f"group_{n:05d}")
+        os.makedirs(gdir, exist_ok=True)
+        with open(os.path.join(gdir, "KEPT.txt"), "w") as k:
+            k.write("The best copy of these photos was kept here:\n" + os.path.relpath(keep, folder) + "\n")
+        for i in g[1:]:
+            src = info[i][0]
+            dest = os.path.join(gdir, os.path.basename(src))
+            os.replace(src, dest)
+            log.write(os.path.relpath(dest, folder) + "\t" + os.path.relpath(src, folder) + "\n")
+            moved += 1
+    log.close()
+    print(f"Moved {moved} look-alike photos into {dup_root} ({len(groups)} groups).")
+    print("The best copy of each stays in its year/month folder. Flip through the groups; anything")
+    print("you want back, just move it out (or run: python3 rescue.py undo " + folder + ").")
+
+
+def cmd_undo(folder):
+    log_path = os.path.join(folder, DUP_DIR, "moves.txt")
+    if not os.path.exists(log_path):
+        sys.exit("Nothing to undo.")
+    back = 0
+    for line in open(log_path):
+        try:
+            now, orig = line.rstrip("\n").split("\t")
+        except ValueError:
+            continue
+        now, orig = os.path.join(folder, now), os.path.join(folder, orig)
+        if os.path.exists(now) and not os.path.exists(orig):
+            os.makedirs(os.path.dirname(orig), exist_ok=True)
+            os.replace(now, orig)
+            back += 1
+    os.remove(log_path)
+    import shutil
+    shutil.rmtree(os.path.join(folder, DUP_DIR), ignore_errors=True) if not any(
+        f != "KEPT.txt" for _, _, fs in os.walk(os.path.join(folder, DUP_DIR)) for f in fs) else None
+    print(f"Put {back} photos back where they were.")
 
 
 def cmd_image(src, dest):
@@ -392,6 +546,10 @@ def cmd_image(src, dest):
 
 
 def main():
+    if len(sys.argv) == 3 and sys.argv[1] in ("similar", "undo"):
+        if not os.path.isdir(sys.argv[2]):
+            sys.exit("Folder not found: " + sys.argv[2])
+        return (cmd_similar if sys.argv[1] == "similar" else cmd_undo)(sys.argv[2])
     if len(sys.argv) != 4 or sys.argv[1] not in ("scan", "sort", "image"):
         print(__doc__)
         sys.exit(1)

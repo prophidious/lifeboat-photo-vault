@@ -34,7 +34,12 @@ object Tools {
                 r.current(it.name)
                 try {
                     zip.putNextEntry(ZipEntry("blobs/${it.id}"))
-                    FileInputStream(v.blobFile(it.id)).use { ins -> ins.copyTo(zip, 1 shl 16) }
+                    if (it.isPlain) {
+                        // Normal visible file: encrypt it on the way into the backup.
+                        val ins = ctx.contentResolver.openInputStream(Uri.parse(it.loc)) ?: throw IOException("File is missing")
+                        val res = ins.buffered(1 shl 16).use { s -> Crypto.encrypt(v.masterCopy(), s, zip) }
+                        if (res.sha256 != it.sha256) throw IOException("File was changed or damaged")
+                    } else FileInputStream(v.blobFile(it.id)).use { ins -> ins.copyTo(zip, 1 shl 16) }
                     zip.closeEntry()
                     val t = v.thumbFile(it.id)
                     if (t.exists()) entry("thumbs/${it.id}", t.readBytes())
@@ -85,29 +90,47 @@ object Tools {
         return "Restore finished.\n" + Importer.summary("Restore", Jobs.state)
     }
 
-    // ---------- Save normal copies out of the vault, filed by year ----------
-    fun export(ctx: Context, tree: Uri, ids: List<String>?, r: Reporter): String {
+    // ---------- Get photos out: copy or move normal files to any folder, filed by year ----------
+    fun export(ctx: Context, tree: Uri, ids: List<String>?, move: Boolean, hide: Boolean, r: Reporter): String {
         val v = Vault.get(ctx)
         val items = if (ids == null) v.list() else ids.mapNotNull { v.find(it) }
         r.total(items.size)
+        val cr = ctx.contentResolver
         val root = DocumentFile.fromTreeUri(ctx, tree) ?: throw IOException("Can't open that folder")
+        if (hide && root.findFile(".nomedia") == null) root.createFile(PlainStore.OCTET, ".nomedia")
         val years = HashMap<String, DocumentFile>()
+        val moved = ArrayList<String>()
         for (it in items) {
+            if (r.cancelled) break
             r.current(it.name)
+            var f: DocumentFile? = null
             try {
                 val y = yearOf(it.taken)
-                val dir = years.getOrPut(y) { root.findFile(y)?.takeIf { d -> d.isDirectory } ?: root.createDirectory(y) ?: throw IOException("Can't make folder $y") }
-                val f = dir.createFile(it.mime, it.name) ?: throw IOException("Can't create file")
-                val ok = ctx.contentResolver.openOutputStream(f.uri)?.use { out -> v.decryptTo(it, out.buffered(1 shl 16)) }
-                    ?: throw IOException("Can't write file")
-                if (!ok) throw IOException("Copy didn't match the original")
+                val dir = years.getOrPut(y) {
+                    (root.findFile(y)?.takeIf { d -> d.isDirectory } ?: root.createDirectory(y) ?: throw IOException("Can't make folder $y"))
+                        .also { d -> if (hide && d.findFile(".nomedia") == null) d.createFile(PlainStore.OCTET, ".nomedia") }
+                }
+                f = dir.createFile(PlainStore.OCTET, it.name) ?: throw IOException("Can't create file")
+                val ok = cr.openOutputStream(f.uri)?.use { out -> v.decryptTo(it, out.buffered(1 shl 16)) } ?: throw IOException("Can't write file")
+                if (!ok) throw IOException("Lifeboat's copy didn't match its fingerprint")
+                // Read the new copy back and compare it byte for byte before it counts.
+                val back = cr.openInputStream(f.uri)?.buffered(1 shl 16)?.use { s -> Crypto.sha256(s) }
+                if (back != it.sha256) throw IOException("The new copy didn't check out")
+                if (move) moved += it.id
                 r.step()
-            } catch (e: Exception) { r.failed(it.name, e) }
+            } catch (e: Exception) {
+                try { f?.delete() } catch (_: Exception) {}
+                r.failed(it.name, e)
+            }
         }
+        if (moved.isNotEmpty()) v.delete(moved)
         val s = Jobs.state
-        return "Saved ${s.done - s.failed} copies, sorted into year folders." +
-            (if (s.failed > 0) "\n⚠️ ${s.failed} failed." else "") +
-            "\n\nThe vault still has the originals. Remember: if Google Photos backs up the folder you saved to, Google can see those copies."
+        val n = s.done - s.failed
+        return (if (move) "Moved $n photos/videos out of Lifeboat" else "Copied $n photos/videos") +
+            ", sorted into year folders, every one checked." +
+            (if (s.failed > 0) "\n\n⚠️ ${s.failed} failed (still in Lifeboat):\n" + s.errors.take(10).joinToString("\n") { "• $it" } else "") +
+            "\n\nTo get them onto your laptop: plug the phone in by USB, choose \"File transfer\", and copy that folder." +
+            (if (hide) "\n\nGoogle Photos and gallery apps won't see that folder (.nomedia)." else "\n\nHeads up: gallery apps can see that folder, and Google Photos will back it up if you turned on backup for it.")
     }
 
     // ---------- Check every file against its fingerprint ----------

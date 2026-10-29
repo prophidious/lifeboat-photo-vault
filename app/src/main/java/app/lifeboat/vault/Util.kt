@@ -80,3 +80,19 @@ fun humanBytes(n: Long): String {
 
 fun formatDate(ms: Long): String = SimpleDateFormat("MMM d, yyyy", Locale.getDefault()).format(Date(ms))
 fun yearOf(ms: Long): String = SimpleDateFormat("yyyy", Locale.US).format(Date(ms))
+
+/** Copies [ins] to [out] while computing SHA-256 and size. */
+fun copyHash(ins: InputStream, out: OutputStream): Crypto.Result {
+    val md = java.security.MessageDigest.getInstance("SHA-256")
+    val buf = ByteArray(1 shl 16)
+    var total = 0L
+    while (true) {
+        val r = ins.read(buf)
+        if (r < 0) break
+        md.update(buf, 0, r); out.write(buf, 0, r); total += r
+    }
+    out.flush()
+    return Crypto.Result(md.digest().hex(), total)
+}
+
+fun monthFolder(ms: Long): String = SimpleDateFormat("MM-MMMM", Locale.US).format(Date(ms))

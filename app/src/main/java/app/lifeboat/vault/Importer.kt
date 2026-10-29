@@ -68,7 +68,7 @@ object Importer {
     }
 
     /** Photos/videos picked one by one (system picker; Google Photos shows up there too). */
-    fun importUris(ctx: Context, uris: List<Uri>, r: Reporter): String {
+    fun importUris(ctx: Context, uris: List<Uri>, r: Reporter, source: String = "picked"): String {
         val v = Vault.get(ctx)
         r.total(uris.size)
         for (u in uris) {
@@ -76,13 +76,16 @@ object Importer {
             val mime = ctx.contentResolver.getType(u)
             if (!isMedia(mime, m.name)) { r.skipped(); continue }
             r.addOne(m.name) {
-                v.add(m.name, mime, null, m.modified, "picked") {
+                v.add(m.name, mime, null, m.modified, source) {
                     ctx.contentResolver.openInputStream(u) ?: throw IOException("Can't open")
                 }
             }
         }
         v.flush()
-        return summary("Picked photos", Jobs.state)
+        return summary("Picked photos", Jobs.state) +
+            if (source == "google" && Jobs.state.failed == 0 && Jobs.state.added + Jobs.state.dupes > 0)
+                "\n\nThey're out of Google's reach now. You can delete them from Google Photos yourself whenever you want."
+            else ""
     }
 
     // ---------- whole folder (e.g. SD card DCIM, or an unzipped Takeout folder) ----------

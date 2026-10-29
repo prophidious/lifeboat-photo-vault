@@ -17,16 +17,20 @@ import java.io.OutputStream
 
 data class Item(
     val id: String, val name: String, val mime: String, val size: Long,
-    val sha256: String, val taken: Long, val added: Long, val source: String
+    val sha256: String, val taken: Long, val added: Long, val source: String,
+    /** "" = encrypted blob inside the vault; otherwise the document URI of a normal visible file in the Lifeboat folder. */
+    val loc: String = ""
 ) {
     val isVideo get() = mime.startsWith("video/")
+    val isPlain get() = loc.isNotEmpty()
     fun toJson(): JSONObject = JSONObject().put("id", id).put("name", name).put("mime", mime)
         .put("size", size).put("sha256", sha256).put("taken", taken).put("added", added).put("source", source)
+        .put("loc", loc)
 
     companion object {
         fun from(o: JSONObject) = Item(
             o.getString("id"), o.getString("name"), o.getString("mime"), o.getLong("size"),
-            o.getString("sha256"), o.getLong("taken"), o.getLong("added"), o.optString("source")
+            o.getString("sha256"), o.getLong("taken"), o.getLong("added"), o.optString("source"), o.optString("loc")
         )
     }
 }
@@ -86,6 +90,18 @@ class Vault private constructor(private val app: Context, private val master: By
 
         fun reset() = synchronized(this) { inst = null }
 
+        /** "plain" = normal visible files in the Lifeboat folder (default), "enc" = encrypted hidden vault. */
+        fun mode(ctx: Context): String {
+            val p = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            p.getString("mode", null)?.let { return it }
+            // Upgrades from v0.2 keep their encrypted vault until the user converts it.
+            val old = listOf(File(ctx.filesDir, "vault"), sdRoot(ctx)).any { r -> r != null && File(r, "blobs").list()?.isNotEmpty() == true }
+            val m = if (old) "enc" else "plain"
+            p.edit().putString("mode", m).commit()
+            return m
+        }
+        fun setMode(ctx: Context, m: String) { ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putString("mode", m).commit() }
+
         fun plainDir(ctx: Context) = File(ctx.cacheDir, "plain").apply { mkdirs() }
         fun wipePlain(ctx: Context) { File(ctx.cacheDir, "plain").deleteRecursively() }
     }
@@ -133,6 +149,7 @@ class Vault private constructor(private val app: Context, private val master: By
      * original bytes -> only then it counts as saved. Duplicates (same bytes) are skipped.
      */
     fun add(name: String, mimeHint: String?, takenHint: Long?, fallbackTaken: Long?, source: String, open: () -> InputStream): Added {
+        if (mode(app) == "plain") return addPlain(name, mimeHint, takenHint, fallbackTaken, source, open)
         val id = Crypto.random(16).hex()
         val tmp = File(blobDir, "$id.tmp")
         val plain = File(plainDir(app), id)
@@ -172,6 +189,75 @@ class Vault private constructor(private val app: Context, private val master: By
         }
     }
 
+    private fun store(): PlainStore = PlainStore.current(app)
+        ?: throw IOException("Pick your Lifeboat folder first (More > Lifeboat folder)")
+
+    /** Plain mode: the photo becomes a normal file in the Lifeboat folder, read back and fingerprint-checked. */
+    private fun addPlain(name: String, mimeHint: String?, takenHint: Long?, fallbackTaken: Long?, source: String, open: () -> InputStream): Added {
+        val st = store()
+        val id = Crypto.random(16).hex()
+        val plain = File(plainDir(app), id)
+        var doc: android.net.Uri? = null
+        try {
+            val res = open().use { ins -> FileOutputStream(plain).use { fos -> val r = copyHash(ins, fos); fos.fd.sync(); r } }
+            if (contains(res.sha256)) return Added.DUPLICATE
+            val mime = mimeHint?.takeIf { isMediaMime(it) } ?: Media.sniffMime(plain, name)
+            val taken = takenHint ?: Media.dateTaken(plain, mime) ?: fallbackTaken ?: System.currentTimeMillis()
+            val d = st.create(taken, name).also { doc = it }
+            st.write(d) { out -> FileInputStream(plain).use { it.copyTo(out, 1 shl 16) } }
+            if (st.sha256(d) != res.sha256) throw IOException("Verification failed for $name")
+            Media.thumbnail(plain, mime)?.let { saveThumb(id, it) }
+            val item = Item(id, name, mime, res.size, res.sha256, taken, System.currentTimeMillis(), source, d.toString())
+            record(item)
+            return Added.NEW
+        } catch (e: Exception) {
+            doc?.let { st.delete(it) }; File(thumbDir, id).delete()
+            throw e
+        } finally {
+            plain.delete()
+        }
+    }
+
+    private fun record(item: Item) = synchronized(items) {
+        put(item)
+        File(journalDir, item.id).writeAtomic(Crypto.encryptBytes(master, item.toJson().toString().toByteArray(Charsets.UTF_8)))
+        if (++pendingJournal >= 100) saveManifestLocked()
+        version++
+    }
+
+    fun encryptedCount() = synchronized(items) { items.values.count { !it.isPlain } }
+
+    /** Turns every encrypted vault item into a normal visible file in the Lifeboat folder. */
+    fun convertToPlain(r: Reporter): String {
+        val st = store()
+        val todo = synchronized(items) { items.values.filter { !it.isPlain } }
+        r.total(todo.size)
+        for (it in todo) {
+            if (r.cancelled) break
+            r.current(it.name)
+            val tmp = File(plainDir(app), "conv-${it.id}")
+            var doc: android.net.Uri? = null
+            try {
+                if (!decryptToFile(it, tmp)) throw IOException("damaged in the vault (didn't match its fingerprint)")
+                val d = st.create(it.taken, it.name).also { x -> doc = x }
+                st.write(d) { out -> FileInputStream(tmp).use { ins -> ins.copyTo(out, 1 shl 16) } }
+                if (st.sha256(d) != it.sha256) throw IOException("copy didn't match the original")
+                record(it.copy(loc = d.toString()))
+                File(blobDir, it.id).delete()
+                r.step()
+            } catch (e: Exception) {
+                doc?.let { x -> st.delete(x) }
+                r.failed(it.name, e)
+            } finally { tmp.delete() }
+        }
+        flush()
+        val s = Jobs.state
+        if (encryptedCount() == 0) setMode(app, "plain")
+        return "${s.done - s.failed} photos/videos are now normal files in ${st.label()}." +
+            (if (s.failed > 0) "\n\n⚠️ ${s.failed} couldn't be converted and are still safe in the encrypted vault:\n" + s.errors.take(10).joinToString("\n") { "• $it" } else "") +
+            "\n\nYou can see them in the Files app and copy them to your laptop over USB. A hidden .nomedia file keeps Google Photos and gallery apps out."
+    }
+
     private fun saveThumb(id: String, b: Bitmap) {
         val bos = ByteArrayOutputStream()
         b.compress(Bitmap.CompressFormat.JPEG, 82, bos)
@@ -188,6 +274,10 @@ class Vault private constructor(private val app: Context, private val master: By
 
     /** Decrypts an item into [out]. Returns true only if the bytes match the original fingerprint. */
     fun decryptTo(item: Item, out: OutputStream): Boolean {
+        if (item.isPlain) {
+            val ins = app.contentResolver.openInputStream(android.net.Uri.parse(item.loc)) ?: throw IOException("File is missing")
+            return ins.buffered(1 shl 16).use { copyHash(it, out) }.sha256 == item.sha256
+        }
         val r = FileInputStream(File(blobDir, item.id)).buffered(1 shl 16).use { Crypto.decrypt(master, it, out) }
         return r.sha256 == item.sha256
     }
@@ -196,13 +286,16 @@ class Vault private constructor(private val app: Context, private val master: By
         FileOutputStream(dest).buffered(1 shl 16).use { decryptTo(item, it) }
 
     fun verify(item: Item): Boolean = try {
-        File(blobDir, item.id).exists() && decryptTo(item, NullOut)
+        (item.isPlain || File(blobDir, item.id).exists()) && decryptTo(item, NullOut)
     } catch (e: Exception) { false }
 
     fun delete(ids: Collection<String>) {
         synchronized(items) {
             for (id in ids) {
-                items.remove(id)?.let { hashes.remove(it.sha256) }
+                items.remove(id)?.let {
+                    hashes.remove(it.sha256)
+                    if (it.isPlain) PlainStore.deleteDoc(app, android.net.Uri.parse(it.loc))
+                }
                 File(blobDir, id).delete(); File(thumbDir, id).delete(); File(journalDir, id).delete()
             }
             saveManifestLocked()

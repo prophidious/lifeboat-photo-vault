@@ -22,6 +22,7 @@ import android.view.ViewGroup
 import android.view.ViewGroup.LayoutParams.MATCH_PARENT
 import android.view.ViewGroup.LayoutParams.WRAP_CONTENT
 import android.view.WindowManager
+import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.ImageView
@@ -29,6 +30,7 @@ import android.widget.LinearLayout
 import android.widget.ProgressBar
 import android.widget.TextView
 import android.widget.Toast
+import androidx.activity.addCallback
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
@@ -60,7 +62,13 @@ class MainActivity : AppCompatActivity() {
     private var shownSeq = -1
     private var noLockWarned = false
     private var pendingBackupPassword: CharArray? = null
-    private var pendingExportIds: List<String>? = null
+    private var pendingOut: Triple<List<String>?, Boolean, Boolean>? = null   // ids (null = all), move, hide
+    private var pendingAfterFolder: (() -> Unit)? = null
+    private var pendingShared: List<Uri>? = null
+    private lateinit var selBar: LinearLayout
+    private lateinit var selText: TextView
+    private val selected = LinkedHashSet<String>()
+    private var selecting = false
 
     private val dp get() = resources.displayMetrics.density
     private fun Int.px() = (this * dp).toInt()
@@ -86,10 +94,45 @@ class MainActivity : AppCompatActivity() {
     private val pickCheck = registerForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
         if (uris.isNotEmpty()) run("Checking ${uris.size} photos") { Importer.checkSafe(this, uris, it) }
     }
-    private val pickExportFolder = registerForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
-        val ids = pendingExportIds
-        pendingExportIds = null
-        if (uri != null) run("Saving copies out") { Tools.export(this, uri, ids, it) }
+    private val pickOutFolder = registerForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
+        val o = pendingOut
+        pendingOut = null
+        if (uri != null && o != null) {
+            endSelection()
+            run(if (o.second) "Moving photos out" else "Copying photos out") { Tools.export(this, uri, o.first, o.second, o.third, it) }
+        }
+    }
+    /** Picks (or creates) the Lifeboat folder, where photos are kept as normal visible files. */
+    private class OpenTreeAt : ActivityResultContracts.OpenDocumentTree() {
+        override fun createIntent(context: Context, input: Uri?): Intent = super.createIntent(context, input).putExtra(
+            android.provider.DocumentsContract.EXTRA_INITIAL_URI,
+            Uri.parse("content://com.android.externalstorage.documents/document/primary%3A")
+        )
+    }
+    private val pickLifeboatFolder = registerForActivityResult(OpenTreeAt()) { uri ->
+        val next = pendingAfterFolder
+        pendingAfterFolder = null
+        if (uri == null) return@registerForActivityResult
+        try {
+            val st = PlainStore.set(this, uri)
+            Toast.makeText(this, "Lifeboat folder: ${st.label()}", Toast.LENGTH_LONG).show()
+            refresh()
+            next?.invoke()
+        } catch (e: Exception) {
+            Toast.makeText(this, "Couldn't use that folder: ${e.message}", Toast.LENGTH_LONG).show()
+        }
+    }
+    /** Opens Google Photos itself so you can pick photos (cloud ones too). Google Photos downloads them for us. */
+    private class PickFromGoogle : ActivityResultContracts.GetMultipleContents() {
+        override fun createIntent(context: Context, input: String): Intent = super.createIntent(context, input)
+            .setPackage("com.google.android.apps.photos")
+            .putExtra(Intent.EXTRA_MIME_TYPES, arrayOf("image/*", "video/*"))
+    }
+    private val pickGoogle = registerForActivityResult(PickFromGoogle()) { uris ->
+        if (uris.isNotEmpty()) run("Saving ${uris.size} from Google Photos") { Importer.importUris(this, uris, it, "google") }
+    }
+    private val pickVisual = registerForActivityResult(ActivityResultContracts.PickMultipleVisualMedia(100)) { uris ->
+        if (uris.isNotEmpty()) run("Saving ${uris.size} photos/videos") { Importer.importUris(this, uris, it, "google") }
     }
     private val createBackup = registerForActivityResult(ActivityResultContracts.CreateDocument("application/octet-stream")) { uri ->
         val pw = pendingBackupPassword
@@ -111,7 +154,39 @@ class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         if (!BuildConfig.DEBUG) window.addFlags(WindowManager.LayoutParams.FLAG_SECURE) // no screenshots, blank in recent apps
+        Vault.mode(this) // decide plain vs encrypted before the vault is first opened
         setContentView(buildUi())
+        onBackPressedDispatcher.addCallback(this) {
+            if (selecting) endSelection() else { isEnabled = false; onBackPressedDispatcher.onBackPressed(); isEnabled = true }
+        }
+        takeShared(intent)
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        takeShared(intent)
+    }
+
+    /** "Share → Lifeboat" from Google Photos, the gallery or Files. */
+    private fun takeShared(i: Intent?) {
+        i ?: return
+        val uris = when (i.action) {
+            Intent.ACTION_SEND -> listOfNotNull(
+                if (Build.VERSION.SDK_INT >= 33) i.getParcelableExtra(Intent.EXTRA_STREAM, Uri::class.java)
+                else @Suppress("DEPRECATION") (i.getParcelableExtra(Intent.EXTRA_STREAM) as? Uri))
+            Intent.ACTION_SEND_MULTIPLE ->
+                (if (Build.VERSION.SDK_INT >= 33) i.getParcelableArrayListExtra(Intent.EXTRA_STREAM, Uri::class.java)
+                else @Suppress("DEPRECATION") i.getParcelableArrayListExtra<Uri>(Intent.EXTRA_STREAM)) ?: emptyList()
+            else -> emptyList()
+        }
+        if (uris.isNotEmpty()) pendingShared = uris
+        i.action = null
+    }
+
+    private fun runShared() {
+        val uris = pendingShared ?: return
+        pendingShared = null
+        requireFolder { run("Saving ${uris.size} shared photos/videos") { Importer.importUris(this, uris, it, "shared") } }
     }
 
     override fun onStart() { super.onStart(); Jobs.listen(jobListener) }
@@ -151,6 +226,40 @@ class MainActivity : AppCompatActivity() {
         lockedView.visibility = View.GONE
         content.visibility = View.VISIBLE
         refresh()
+        if (pendingShared != null) runShared() else offerVisible()
+    }
+
+    /** v0.2 vaults were encrypted and hidden. Offer once to turn them into normal files you can see. */
+    private fun offerVisible() {
+        val prefs = getSharedPreferences("lifeboat", Context.MODE_PRIVATE)
+        if (prefs.getBoolean("askedVisible", false)) return
+        val n = try { Vault.get(this).encryptedCount() } catch (e: Exception) { 0 }
+        if (n == 0) return
+        prefs.edit().putBoolean("askedVisible", true).apply()
+        AlertDialog.Builder(this).setTitle("Make your photos normal files?")
+            .setMessage("New in this version: Lifeboat can keep your photos as normal files in a folder you pick on the phone or SD card. " +
+                "You can see them in the Files app and copy them straight to your laptop.\n\n" +
+                "Google Photos and gallery apps still can't see them, and Lifeboat still has no internet.\n\n" +
+                "This converts all $n photos/videos. Each copy is checked before the hidden one is removed.")
+            .setPositiveButton("Yes, make them visible") { _, _ -> convertVisible() }
+            .setNegativeButton("Not now", null).show()
+    }
+
+    private fun convertVisible() {
+        Vault.setMode(this, "plain")
+        requireFolder { run("Making your photos visible") { Vault.get(this).convertToPlain(it) } }
+    }
+
+    /** Runs [then] once a Lifeboat folder is set (only needed for normal visible files). */
+    private fun requireFolder(then: () -> Unit) {
+        if (Vault.mode(this) == "enc" || PlainStore.current(this) != null) { then(); return }
+        AlertDialog.Builder(this).setTitle("Pick your Lifeboat folder")
+            .setMessage("Your photos will be kept here as normal files you can see and copy to your laptop.\n\n" +
+                "On the next screen:\n1️⃣  Choose the phone or your SD card (☰ menu, top left).\n" +
+                "2️⃣  Tap \"Create new folder\" and name it Lifeboat.\n3️⃣  Tap \"Use this folder\", then Allow.\n\n" +
+                "Lifeboat adds a hidden .nomedia file so Google Photos and gallery apps leave it alone. Don't use DCIM or Pictures.")
+            .setPositiveButton("Choose folder") { _, _ -> pendingAfterFolder = then; pickLifeboatFolder.launch(null) }
+            .setNegativeButton("Cancel", null).show()
     }
 
     // ---------- UI ----------
@@ -165,7 +274,7 @@ class MainActivity : AppCompatActivity() {
         stats = TextView(this).apply { textSize = 14f; alpha = 0.8f }
         col.addView(stats)
         col.addView(TextView(this).apply {
-            text = "🧱 No internet · Encrypted · Invisible to Google Photos & gallery apps"
+            text = "🧱 No internet · Google Photos can't see it · Your photos stay yours"
             textSize = 12f; alpha = 0.65f; setPadding(0, 2.px(), 0, 10.px())
             setOnClickListener { aboutWall() }
         })
@@ -182,10 +291,26 @@ class MainActivity : AppCompatActivity() {
             setPadding(4.px(), paddingTop, 4.px(), paddingBottom); setOnClickListener { click() }
         }
         val lp = { w: Float -> LinearLayout.LayoutParams(0, WRAP_CONTENT, w).apply { marginEnd = 6.px() } }
-        row.addView(small("＋ Add") { addMenu() }, lp(1f))
-        row.addView(small("Safe to delete?") { safeToDelete() }, lp(1.7f))
-        row.addView(small("More") { moreMenu() }, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
+        row.addView(small("＋ Add") { requireFolder { addMenu() } }, lp(1f))
+        row.addView(small("⬇ Get out") { getOut() }, lp(1f))
+        row.addView(small("⋮ More") { moreMenu() }, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
         col.addView(row)
+
+        selBar = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL; visibility = View.GONE }
+        selText = TextView(this).apply { textSize = 15f; setTypeface(typeface, Typeface.BOLD) }
+        fun flat(label: String, click: () -> Unit) = MaterialButton(this, null, com.google.android.material.R.attr.borderlessButtonStyle).apply {
+            text = label; isAllCaps = false; textSize = 14f; setPadding(6.px(), 0, 6.px(), 0); minWidth = 0; minimumWidth = 0; setOnClickListener { click() }
+        }
+        selBar.addView(selText, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
+        selBar.addView(flat("All") { selectAll() })
+        selBar.addView(flat("Cancel") { endSelection() })
+        selBar.addView(MaterialButton(this).apply {
+            text = "Next ➜"; isAllCaps = false; setOnClickListener {
+                if (selected.isEmpty()) Toast.makeText(this@MainActivity, "Tap photos to select them", Toast.LENGTH_SHORT).show()
+                else outChoice(selected.toList())
+            }
+        })
+        col.addView(selBar)
 
         progressBox = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL; visibility = View.GONE; setPadding(0, 10.px(), 0, 6.px())
@@ -203,9 +328,9 @@ class MainActivity : AppCompatActivity() {
 
         empty = TextView(this).apply {
             textSize = 15f; gravity = Gravity.CENTER; setPadding(12.px(), 40.px(), 12.px(), 0); alpha = 0.75f
-            text = "Your vault is empty.\n\nTap \"Rescue my Google Photos\" to pull your whole library out of Google, " +
-                "or \"＋ Add\" to save photos from your phone or SD card.\n\nOnce a photo is in here, nothing Google, Motorola " +
-                "or any trash can does can touch it."
+            text = "Lifeboat is empty.\n\nTap \"＋ Add\" to bring in photos from your phone, SD card or Google Photos, " +
+                "or \"Rescue my Google Photos\" to pull out your whole library.\n\nOnce a photo is in here, nothing Google, Motorola " +
+                "or any trash can does can touch it. Tap \"⬇ Get out\" any time to copy them anywhere."
         }
         col.addView(empty)
 
@@ -242,8 +367,9 @@ class MainActivity : AppCompatActivity() {
             return
         }
         val items = v.list()
-        val where = if (Vault.location(this) == "sd") "SD card" else "phone"
-        stats.text = "${items.size} photos & videos · ${humanBytes(v.totalBytes())} · on the $where"
+        val where = if (Vault.mode(this) == "plain") (PlainStore.current(this)?.label() ?: "no folder picked yet")
+            else if (Vault.location(this) == "sd") "encrypted, on the SD card" else "encrypted, on the phone"
+        stats.text = "${items.size} photos & videos · ${humanBytes(v.totalBytes())} · $where"
         empty.visibility = if (items.isEmpty()) View.VISIBLE else View.GONE
         adapter.submit(items)
     }
@@ -292,7 +418,8 @@ class MainActivity : AppCompatActivity() {
                 "2️⃣  Tap \"Next step\". Keep \"Send download link via email\" and choose .zip and 50 GB. Then tap \"Create export\".\n" +
                 "3️⃣  Google emails you when it's ready (minutes to a day or two). Tap each download link. The files land in Downloads.\n" +
                 "4️⃣  Come back here, tap \"Bring them in\" and select all the takeout files.\n\n" +
-                "Lifeboat pulls every photo and video straight out of the zips, checks each one, fixes the dates and puts them behind the wall."
+                "Lifeboat pulls every photo and video straight out of the zips, checks each one, fixes the dates and puts them behind the wall.\n\n" +
+                "Only need some photos? Use ＋ Add → From Google Photos instead."
             )
             .setPositiveButton("Open Google export") { _, _ ->
                 try {
@@ -301,26 +428,91 @@ class MainActivity : AppCompatActivity() {
                     Toast.makeText(this, "Open takeout.google.com in your browser", Toast.LENGTH_LONG).show()
                 }
             }
-            .setNegativeButton("Bring them in") { _, _ -> pickZips.launch(arrayOf("application/zip", "application/x-zip-compressed", "application/octet-stream")) }
+            .setNegativeButton("Bring them in") { _, _ -> requireFolder { pickZips.launch(arrayOf("application/zip", "application/x-zip-compressed", "application/octet-stream")) } }
             .show()
     }
 
     private fun addMenu() {
-        val opts = arrayOf(
-            "Photos & videos (phone, SD card or Google Photos)",
-            "A whole folder (e.g. DCIM on your SD card)",
-            "Google Takeout zip files",
-            "🛟 Recover DELETED photos from an SD card (USB card reader)"
-        )
-        AlertDialog.Builder(this).setTitle("Add to the vault").setItems(opts) { _, w ->
+        val opts = arrayOf("📱  From the phone", "💾  From the SD card", "☁️  From Google Photos (pick which ones)", "📦  ALL of Google Photos (Takeout)")
+        AlertDialog.Builder(this).setTitle("Add to Lifeboat").setItems(opts) { _, w ->
             when (w) {
-                0 -> pickMedia.launch(arrayOf("image/*", "video/*"))
-                1 -> pickFolder.launch(null)
-                2 -> pickZips.launch(arrayOf("application/zip", "application/x-zip-compressed", "application/octet-stream"))
-                3 -> recoverGuide()
+                0 -> pickOrFolder("From the phone", "e.g. DCIM › Camera")
+                1 -> pickOrFolder("From the SD card", "e.g. DCIM on the SD card. Open it from the ☰ menu")
+                2 -> fromGoogle()
+                3 -> rescueGuide()
             }
         }.show()
     }
+
+    private fun pickOrFolder(title: String, hint: String) {
+        AlertDialog.Builder(this).setTitle(title).setItems(arrayOf("Pick photos & videos", "A whole folder ($hint)")) { _, w ->
+            if (w == 0) pickMedia.launch(arrayOf("image/*", "video/*")) else pickFolder.launch(null)
+        }.show()
+    }
+
+    private fun fromGoogle() {
+        AlertDialog.Builder(this).setTitle("From Google Photos")
+            .setMessage("Google Photos opens. Select the photos you want (long-press one, then tap the rest) and tap Done. " +
+                "They get downloaded straight into Lifeboat, out of Google's reach.\n\n" +
+                "Another way: in Google Photos, select photos → Share → Lifeboat.\n\n" +
+                "Afterwards you can delete them from Google Photos yourself. Not sure? Use ⋮ More → \"Safe to delete?\" first.")
+            .setPositiveButton("Open Google Photos") { _, _ ->
+                try { pickGoogle.launch("*/*") } catch (e: android.content.ActivityNotFoundException) {
+                    pickVisual.launch(androidx.activity.result.PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageAndVideo))
+                }
+            }
+            .setNegativeButton("Cancel", null).show()
+    }
+
+    // ---------- getting photos out ----------
+    private fun getOut() {
+        val n = try { Vault.get(this).count() } catch (e: Exception) { 0 }
+        if (n == 0) { Toast.makeText(this, "Nothing in Lifeboat yet", Toast.LENGTH_SHORT).show(); return }
+        AlertDialog.Builder(this).setTitle("Get photos out").setItems(arrayOf("Choose photos", "All $n photos & videos")) { _, w ->
+            if (w == 0) startSelection(null) else outChoice(null)
+        }.show()
+    }
+
+    /** Copy (keep in Lifeboat too) or move (remove Lifeboat's copy after checking) to any folder on the phone or SD card. */
+    private fun outChoice(ids: List<String>?) {
+        val count = ids?.size ?: Vault.get(this).count()
+        val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(24.px(), 8.px(), 24.px(), 0) }
+        box.addView(TextView(this).apply {
+            textSize = 14f
+            text = "Next, pick or create a folder on the phone or SD card (☰ menu, top left). Photos are saved there as normal files, sorted by year.\n\n" +
+                "Copy = they stay in Lifeboat too.\nMove = Lifeboat's copy is removed after the new one is checked.\n\n" +
+                "Deleting from Lifeboat never deletes copies you saved somewhere else."
+        })
+        val hide = CheckBox(this).apply { text = "Hide them from Google Photos & gallery apps"; isChecked = true }
+        box.addView(hide)
+        AlertDialog.Builder(this).setTitle("$count photos & videos").setView(box)
+            .setPositiveButton("Copy") { _, _ -> pendingOut = Triple(ids, false, hide.isChecked); pickOutFolder.launch(null) }
+            .setNeutralButton("Move") { _, _ -> pendingOut = Triple(ids, true, hide.isChecked); pickOutFolder.launch(null) }
+            .setNegativeButton("Cancel", null).show()
+    }
+
+    private fun startSelection(first: String?) {
+        selecting = true
+        selected.clear(); first?.let { selected += it }
+        selBar.visibility = View.VISIBLE
+        updateSel()
+        if (first == null) Toast.makeText(this, "Tap photos to select them", Toast.LENGTH_SHORT).show()
+    }
+
+    private fun endSelection() {
+        selecting = false; selected.clear(); selBar.visibility = View.GONE
+        adapter.notifyDataSetChanged()
+    }
+
+    private fun selectAll() {
+        val all = Vault.get(this).list().map { it.id }
+        if (selected.size == all.size) selected.clear() else { selected.clear(); selected += all }
+        updateSel()
+    }
+
+    private fun toggle(id: String) { if (!selected.remove(id)) selected += id; updateSel() }
+
+    private fun updateSel() { selText.text = "${selected.size} selected"; adapter.notifyDataSetChanged() }
 
     // ---------- deleted-photo recovery through a USB card reader ----------
     private val usbAction by lazy { "$packageName.USB_PERMISSION" }
@@ -336,10 +528,10 @@ class MainActivity : AppCompatActivity() {
                 "2️⃣  Put it in a USB card reader and plug that into the phone (use an OTG adapter if needed).\n" +
                 "3️⃣  If Android asks to FORMAT or \"fix\" the card, tap Cancel. Formatting can destroy what's left.\n" +
                 "4️⃣  Tap \"Scan the card\" and allow access.\n\n" +
-                "Lifeboat only READS the card and never writes to it. Everything it finds is checked and goes straight into the vault. " +
+                "Lifeboat only READS the card and never writes to it. Everything it finds is checked and goes straight into Lifeboat. " +
                 "Big cards take a while (roughly 1–3 min per GB). Keep the phone plugged in."
             )
-            .setPositiveButton("Scan the card") { _, _ -> pickUsbDevice() }
+            .setPositiveButton("Scan the card") { _, _ -> requireFolder { pickUsbDevice() } }
             .setNegativeButton("Cancel", null).show()
     }
 
@@ -382,43 +574,61 @@ class MainActivity : AppCompatActivity() {
     private fun safeToDelete() {
         AlertDialog.Builder(this)
             .setTitle("Safe to delete?")
-            .setMessage("Pick the photos you want to delete from Google Photos or your phone. Lifeboat checks each one, byte for byte, against the vault and tells you which ones are safe to delete and which aren't.")
+            .setMessage("Pick the photos you want to delete from Google Photos or your phone. Lifeboat checks each one, byte for byte, against what it has and tells you which ones are safe to delete and which aren't.")
             .setPositiveButton("Pick photos") { _, _ -> pickCheck.launch(arrayOf("image/*", "video/*")) }
             .setNegativeButton("Cancel", null).show()
     }
 
     private fun moreMenu() {
+        val v = try { Vault.get(this) } catch (e: Exception) { null }
+        val encN = v?.encryptedCount() ?: 0
         val sd = Vault.sdRoot(this) != null
         val onSd = Vault.location(this) == "sd"
+        val folder = PlainStore.current(this)
         val opts = mutableListOf(
-            "Back up the vault (password-locked file)",
-            "Restore a backup",
-            "Check every file",
-            "Save copies of everything out (by year)",
+            "🛟  Recover DELETED photos from an SD card",
+            "✅  Safe to delete from Google?",
+            "📁  Lifeboat folder: ${folder?.label() ?: "not picked"}",
         )
-        if (onSd) opts += "Move vault to the phone" else if (sd) opts += "Move vault to the SD card"
+        if (encN > 0) opts += "👁  Make $encN hidden photos visible files"
+        opts += listOf("🔐  Back up everything (password-locked file)", "♻️  Restore a backup", "🔎  Check every file")
+        if (encN > 0) { if (onSd) opts += "Move hidden vault to the phone" else if (sd) opts += "Move hidden vault to the SD card" }
         opts += "About the wall"
         AlertDialog.Builder(this).setItems(opts.toTypedArray()) { _, w ->
-            when (opts[w]) {
-                opts[0] -> askPassword("Choose a backup password", confirm = true) { pw ->
+            val o = opts[w]
+            when {
+                o.startsWith("🛟") -> recoverGuide()
+                o.startsWith("✅") -> safeToDelete()
+                o.startsWith("📁") -> changeFolder()
+                o.startsWith("👁") -> convertVisible()
+                o.startsWith("🔐") -> askPassword("Choose a backup password", confirm = true) { pw ->
                     pendingBackupPassword = pw
                     val stamp = SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date())
                     createBackup.launch("lifeboat-backup-$stamp.lifeboat")
                 }
-                opts[1] -> openBackup.launch(arrayOf("*/*"))
-                opts[2] -> run("Checking every file") { Tools.verifyAll(this, it) }
-                opts[3] -> { pendingExportIds = null; pickExportFolder.launch(null) }
-                "Move vault to the phone" -> confirmMove("phone")
-                "Move vault to the SD card" -> confirmMove("sd")
-                "About the wall" -> aboutWall()
+                o.startsWith("♻️") -> requireFolder { openBackup.launch(arrayOf("*/*")) }
+                o.startsWith("🔎") -> run("Checking every file") { Tools.verifyAll(this, it) }
+                o == "Move hidden vault to the phone" -> confirmMove("phone")
+                o == "Move hidden vault to the SD card" -> confirmMove("sd")
+                else -> aboutWall()
             }
         }.show()
+    }
+
+    private fun changeFolder() {
+        val cur = PlainStore.current(this)
+        AlertDialog.Builder(this).setTitle("Lifeboat folder")
+            .setMessage((if (cur != null) "Now: ${cur.label()}\n\n" else "") +
+                "New photos are saved to this folder as normal files, sorted into year and month folders. You can open it in the Files app or copy it to your laptop over USB.\n\n" +
+                "Changing it only affects new photos. The ones already saved stay where they are.")
+            .setPositiveButton("Choose folder") { _, _ -> pendingAfterFolder = null; pickLifeboatFolder.launch(null) }
+            .setNegativeButton("Close", null).show()
     }
 
     private fun confirmMove(to: String) {
         AlertDialog.Builder(this)
             .setTitle(if (to == "sd") "Move to SD card?" else "Move to phone?")
-            .setMessage("Everything is copied and checked first. The old copy is deleted only after that.\n\nNote: Android deletes an app's files, on the SD card too, if you uninstall the app. Keep a backup.")
+            .setMessage("Everything is copied and checked first. The old copy is deleted only after that.\n\nNote: Android deletes the hidden vault, on the SD card too, if you uninstall the app. Make your photos visible files or keep a backup.")
             .setPositiveButton("Move") { _, _ -> run("Moving the vault") { Tools.move(this, to, it) } }
             .setNegativeButton("Cancel", null).show()
     }
@@ -426,12 +636,13 @@ class MainActivity : AppCompatActivity() {
     private fun aboutWall() {
         AlertDialog.Builder(this).setTitle("The wall").setMessage(
             "• No internet permission. Lifeboat physically can't upload or sync anything. Android blocks it.\n\n" +
-            "• Invisible. Vault files are encrypted, have no file names or extensions and sit in a private app folder that Google Photos, Motorola's gallery and the media scanner skip.\n\n" +
-            "• No cloud backup. Android/Google backup is switched off for this app.\n\n" +
+            "• Your files, visible to you. Photos are normal files in your Lifeboat folder. Open it in the Files app or copy it to a laptop.\n\n" +
+            "• Invisible to Google. A .nomedia file in every folder keeps Google Photos, Motorola's gallery and the media scanner out, so nothing gets backed up to Google.\n\n" +
             "• Verified copies. Every photo is copied, read back and compared to the original's fingerprint (SHA-256) before it counts as saved.\n\n" +
-            "• Trash-proof. Deleting or emptying a trash in Google Photos, Gallery or Files can't touch what's in here.\n\n" +
+            "• Trash-proof. Deleting or emptying a trash in Google Photos or Gallery can't touch what's in here.\n\n" +
+            "• Deleting in Lifeboat only deletes Lifeboat's copy. Copies you saved elsewhere stay.\n\n" +
             "• Locked. Uses your phone's screen lock or fingerprint. Screenshots are blocked.\n\n" +
-            "⚠️ One rule: if you uninstall Lifeboat, Android deletes the vault. Use \"Back up the vault\" and keep the file on a USB stick or computer."
+            "Tip: don't rename or move files inside the Lifeboat folder yourself, or Lifeboat loses track of them. Use ⬇ Get out to copy them anywhere."
         ).setPositiveButton("OK", null).show()
     }
 
@@ -455,13 +666,15 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun itemMenu(item: Item) {
-        AlertDialog.Builder(this).setTitle(item.name)
-            .setMessage("${formatDate(item.taken)} · ${humanBytes(item.size)}\nFingerprint: ${item.sha256.take(16)}…")
-            .setItems(arrayOf("Save a copy out", "Delete from vault")) { _, w ->
+        // NOTE: setMessage() and setItems() can't be combined (message hides the list), so info goes in the title.
+        AlertDialog.Builder(this)
+            .setTitle("${item.name}\n${formatDate(item.taken)} · ${humanBytes(item.size)}")
+            .setItems(arrayOf("Select more…", "Copy or move out", "Delete from Lifeboat")) { _, w ->
                 when (w) {
-                    0 -> { pendingExportIds = listOf(item.id); pickExportFolder.launch(null) }
-                    1 -> AlertDialog.Builder(this).setTitle("Delete from the vault?")
-                        .setMessage("This deletes Lifeboat's copy permanently. There's no trash can here, on purpose.")
+                    0 -> startSelection(item.id)
+                    1 -> outChoice(listOf(item.id))
+                    2 -> AlertDialog.Builder(this).setTitle("Delete from Lifeboat?")
+                        .setMessage("This permanently deletes Lifeboat's copy. Copies you saved somewhere else are not touched. There's no trash can here, on purpose.")
                         .setPositiveButton("Delete") { _, _ -> Vault.get(this).delete(listOf(item.id)); refresh() }
                         .setNegativeButton("Cancel", null).show()
                 }
@@ -478,7 +691,7 @@ class MainActivity : AppCompatActivity() {
         private var items: List<Item> = emptyList()
         fun submit(list: List<Item>) { items = list; notifyDataSetChanged() }
 
-        inner class VH(val root: SquareFrame, val img: ImageView, val badge: TextView) : RecyclerView.ViewHolder(root)
+        inner class VH(val root: SquareFrame, val img: ImageView, val badge: TextView, val check: TextView) : RecyclerView.ViewHolder(root)
 
         override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): VH {
             val f = SquareFrame(parent.context).apply { setPadding(2, 2, 2, 2) }
@@ -488,7 +701,12 @@ class MainActivity : AppCompatActivity() {
             }
             f.addView(img, FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT))
             f.addView(badge, FrameLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT, Gravity.BOTTOM or Gravity.START))
-            return VH(f, img, badge)
+            val check = TextView(parent.context).apply {
+                text = "✓"; setTextColor(Color.WHITE); textSize = 16f; gravity = Gravity.CENTER
+                setBackgroundColor(0xFF1E88E5.toInt()); visibility = View.GONE
+            }
+            f.addView(check, FrameLayout.LayoutParams(28.px(), 28.px(), Gravity.TOP or Gravity.END))
+            return VH(f, img, badge, check)
         }
 
         override fun getItemCount() = items.size
@@ -507,8 +725,14 @@ class MainActivity : AppCompatActivity() {
                     h.img.post { if (h.img.tag == it.id) h.img.setImageBitmap(b) }
                 }
             }
-            h.root.setOnClickListener { _ -> startActivity(Intent(this@MainActivity, ViewerActivity::class.java).putExtra("id", it.id)) }
-            h.root.setOnLongClickListener { _ -> itemMenu(it); true }
+            val sel = selecting && it.id in selected
+            h.check.visibility = if (sel) View.VISIBLE else View.GONE
+            h.img.alpha = if (selecting && !sel) 0.55f else 1f
+            h.root.setOnClickListener { _ ->
+                if (selecting) toggle(it.id)
+                else startActivity(Intent(this@MainActivity, ViewerActivity::class.java).putExtra("id", it.id))
+            }
+            h.root.setOnLongClickListener { _ -> if (selecting) toggle(it.id) else itemMenu(it); true }
         }
     }
 }
